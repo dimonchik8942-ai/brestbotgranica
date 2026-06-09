@@ -1,0 +1,11 @@
+{
+  "389597080": {
+    "threshold": 50,
+    "enabled": false,
+    "interval": 5,
+    "last_checked": 1780611501.6960182,
+    "step": 25,
+    "notified_step": 9,
+    "paused_until": 1780697943.3475397
+  }
+}
