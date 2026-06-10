@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import time
 import threading
@@ -92,36 +91,14 @@ def update_chat_settings(chat_id: str, **kwargs):
 
 # ── Data fetching ────────────────────────────────────────────────────────────
 
-GPK_URL = "https://gpk.gov.by/situation-at-the-border/"
-GPK_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'text/html,application/xhtml+xml',
-    'Accept-Language': 'ru-RU,ru',
-}
-
-
-def _gpk_parse(html: str, title: str) -> str:
-    m = re.search(
-        r'<td[^>]*title="' + re.escape(title) + r'"[^>]*>\s*(.*?)\s*</td>',
-        html, re.DOTALL
-    )
-    if not m:
-        return "?"
-    raw = re.sub(r'<[^>]+>', '', m.group(1)).strip()
-    if not raw or raw == '-':
-        return "0"
-    n = re.search(r'\((\d+)\)', raw)
-    return n.group(1) if n else raw
-
-
-def _fetch_bts() -> dict | None:
-    """Try belarusborder.by real-time API (short timeout — it may be unavailable)."""
+def fetch_queue() -> dict | None:
+    """Fetch real-time queue from belarusborder.by (BTS electronic queue)."""
     try:
         resp = requests.get(
             BTS_API,
             params={"token": BTS_TOKEN, "checkpointId": BREST_CHECKPOINT_ID},
             headers=HEADERS,
-            timeout=8,
+            timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -134,56 +111,19 @@ def _fetch_bts() -> dict | None:
             "cars_live":  cars_live,
             "cars_prio":  cars_prio,
             "motos":      motos,
-            "trucks":     None,
-            "buses":      None,
-            "source":     "bts",
         }
     except Exception:
         return None
-
-
-def _fetch_gpk() -> dict | None:
-    """Fallback: gpk.gov.by HTML (updates ~every 2 h but always accessible)."""
-    try:
-        resp = requests.get(GPK_URL, headers=GPK_HEADERS, timeout=12)
-        resp.raise_for_status()
-        html = resp.text
-        cars_str = _gpk_parse(html, "Брест: выезд легковых автомобилей")
-        return {
-            "cars_total": int(cars_str) if cars_str.isdigit() else 0,
-            "cars_live":  int(cars_str) if cars_str.isdigit() else 0,
-            "cars_prio":  0,
-            "motos":      0,
-            "trucks":     _gpk_parse(html, "Брест: выезд грузовых автомобилей"),
-            "buses":      _gpk_parse(html, "Брест: выезд автобусов"),
-            "source":     "gpk",
-        }
-    except Exception:
-        return None
-
-
-def fetch_queue() -> dict | None:
-    """Try BTS real-time API first; fall back to GPK on any error."""
-    return _fetch_bts() or _fetch_gpk()
 
 
 def format_queue(q: dict) -> str:
-    if q["source"] == "bts":
-        lines = ["🚗 *Брест — очередь (выезд):*",
-                 f"  Легковые: *{q['cars_total']}* шт."]
-        if q["cars_prio"]:
-            lines.append(f"  _(в т.ч. приоритет: {q['cars_prio']})_")
-        if q["motos"]:
-            lines.append(f"  Мотоциклы: *{q['motos']}* шт.")
-        lines += ["", "_(belarusborder.by — реальное время)_"]
-    else:
-        lines = ["🚗 *Брест — очередь (выезд):*",
-                 f"  Легковые: *{q['cars_total']}* шт."]
-        if q["trucks"] is not None:
-            lines.append(f"  Грузовики: *{q['trucks']}* шт.")
-        if q["buses"] is not None:
-            lines.append(f"  Автобусы:  *{q['buses']}* шт.")
-        lines += ["", "_(gpk.gov.by — обновление ~раз в 2 ч)_"]
+    lines = ["🚗 *Брест — очередь (выезд):*",
+             f"  Легковые: *{q['cars_total']}* шт."]
+    if q["cars_prio"]:
+        lines.append(f"  _(в т.ч. приоритет: {q['cars_prio']})_")
+    if q["motos"]:
+        lines.append(f"  Мотоциклы: *{q['motos']}* шт.")
+    lines += ["", "_(belarusborder.by — реальное время)_"]
     return "\n".join(lines)
 
 
@@ -288,6 +228,7 @@ def start(message):
         "/setstep — шаг уведомлений (каждые N авто)\n"
         "/setinterval — частота проверки (1 / 5 / 15 мин)\n"
         "/threshold — показать все настройки\n"
+        "/source — статус соединения с источником данных\n"
         "/help — справка",
         parse_mode='Markdown'
     )
@@ -311,7 +252,8 @@ def help_cmd(message):
         "/setstep — задать шаг уведомлений\n"
         "/setinterval — частота проверки (1 / 5 / 15 мин)\n"
         "/threshold — показать все настройки\n"
-        "/check — проверить очередь прямо сейчас\n\n"
+        "/check — проверить очередь прямо сейчас\n"
+        "/source — статус соединения с источником данных\n\n"
         "Данные: belarusborder.by (электронная очередь БТС, реальное время)",
         parse_mode='Markdown'
     )
@@ -325,6 +267,70 @@ def check(message):
         bot.reply_to(message, format_queue(queue), parse_mode='Markdown')
     else:
         bot.reply_to(message, "❌ Не удалось получить данные. Попробуйте позже.")
+
+
+@bot.message_handler(commands=['source'])
+def source_cmd(message):
+    import time as _time
+    bot.reply_to(message, "🔍 Проверяю соединение с belarusborder.by...")
+    t0 = _time.time()
+    try:
+        resp = requests.get(
+            BTS_API,
+            params={"token": BTS_TOKEN, "checkpointId": BREST_CHECKPOINT_ID},
+            headers=HEADERS,
+            timeout=15,
+        )
+        elapsed = _time.time() - t0
+        if resp.status_code == 200:
+            data = resp.json()
+            cars = len(data.get("carLiveQueue") or []) + len(data.get("carPriority") or [])
+            bot.reply_to(
+                message,
+                f"✅ *belarusborder.by — доступен*\n\n"
+                f"  Время ответа: *{elapsed:.1f} с*\n"
+                f"  HTTP статус: *{resp.status_code}*\n"
+                f"  Данные получены: *{cars}* авто в очереди\n\n"
+                f"Источник работает нормально 🟢",
+                parse_mode='Markdown'
+            )
+        else:
+            bot.reply_to(
+                message,
+                f"⚠️ *belarusborder.by — ошибка*\n\n"
+                f"  HTTP статус: *{resp.status_code}*\n"
+                f"  Время: *{elapsed:.1f} с*",
+                parse_mode='Markdown'
+            )
+    except requests.exceptions.ConnectTimeout:
+        elapsed = _time.time() - t0
+        bot.reply_to(
+            message,
+            f"🔴 *belarusborder.by — недоступен*\n\n"
+            f"  Причина: таймаут соединения ({elapsed:.0f} с)\n"
+            f"  Сервер не отвечает — возможно, заблокирован с текущего IP.\n\n"
+            f"Попробуйте перенести бота на европейский хостинг.",
+            parse_mode='Markdown'
+        )
+    except requests.exceptions.ConnectionError:
+        elapsed = _time.time() - t0
+        bot.reply_to(
+            message,
+            f"🔴 *belarusborder.by — недоступен*\n\n"
+            f"  Причина: соединение отклонено ({elapsed:.1f} с)\n"
+            f"  IP текущего сервера заблокирован.\n\n"
+            f"Попробуйте перенести бота на европейский хостинг.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        elapsed = _time.time() - t0
+        bot.reply_to(
+            message,
+            f"🔴 *belarusborder.by — ошибка*\n\n"
+            f"  {str(e)[:100]}\n"
+            f"  Время: *{elapsed:.1f} с*",
+            parse_mode='Markdown'
+        )
 
 
 @bot.message_handler(commands=['enable'])
@@ -602,5 +608,18 @@ def fallback(message):
 
 
 if __name__ == '__main__':
+    bot.set_my_commands([
+        telebot.types.BotCommand("check",         "🚗 Текущая очередь"),
+        telebot.types.BotCommand("enable",        "✅ Включить уведомления"),
+        telebot.types.BotCommand("disable",       "🔕 Выключить уведомления"),
+        telebot.types.BotCommand("pause",         "⏸ Пауза уведомлений"),
+        telebot.types.BotCommand("resume",        "▶️ Снять паузу"),
+        telebot.types.BotCommand("setstep",       "📈 Шаг уведомлений"),
+        telebot.types.BotCommand("setinterval",   "🕐 Частота проверки"),
+        telebot.types.BotCommand("set_threshold", "🎯 Задать порог"),
+        telebot.types.BotCommand("threshold",     "📊 Мои настройки"),
+        telebot.types.BotCommand("source",        "🔌 Статус источника данных"),
+        telebot.types.BotCommand("help",          "ℹ️ Справка"),
+    ])
     print("✅ Бот запущен. Напишите /start в Телеграме.")
     bot.infinity_polling(logger_level=None)
