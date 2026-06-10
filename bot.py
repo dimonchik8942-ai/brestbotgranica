@@ -5,7 +5,10 @@ import threading
 import requests
 import telebot
 
-TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    raise SystemExit("❌ Переменная окружения TELEGRAM_BOT_TOKEN не задана.\n"
+                     "   Добавьте её в настройках хостинга (Variables / Secrets).")
 
 bot = telebot.TeleBot(TOKEN)
 
