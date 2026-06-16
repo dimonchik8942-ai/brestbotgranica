@@ -28,7 +28,10 @@ PLANNER_ALERT_BUFFER = 0.5       # warn 30 min before calculated register time
 
 CAR_MILESTONES = [300, 200, 100, 50, 25, 10]  # notify at each of these positions
 _CAR_REG_FIELDS = ("regNumber", "carNumber", "registrationNumber",
-                   "number", "plate", "vehicleNumber", "autoNumber", "номер")
+                   "number", "plate", "vehicleNumber", "autoNumber",
+                   "gosNomer", "gosNumber", "nomer", "avtoNomer",
+                   "regNomer", "carNomer", "номер", "гос_номер",
+                   "reg", "vehicle", "car", "auto")
 MAX_TRACKED_CARS = 5
 
 MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
@@ -228,25 +231,35 @@ def fetch_queue() -> dict | None:
         motos = (len(data.get("motorcycleLiveQueue") or [])
                  + len(data.get("motorcyclePriority") or []))
 
-        # "Направлено за последний час" — current throughput (cars/hour)
-        dispatched_1h = None
-        for field in ("направлено за последний час",
-                      "carSentLastHour", "sentLastHour", "passed1h"):
-            val = data.get(field)
-            if isinstance(val, (int, float)) and val > 0:
-                dispatched_1h = int(val)
-                break
+        # Case-insensitive lookup map for throughput fields
+        data_ci = {k.lower().strip(): v for k, v in data.items()}
 
-        # "Направлено за последние 24 часа" — daily average throughput
-        dispatched_24h = None
-        for field in ("направлено за последние 24 часа",
-                      "carSentCount", "carPassedCount", "passedCount",
-                      "sentCount", "dispatchedCount", "carDispatched",
-                      "carSent", "passed24h", "sent24h"):
-            val = data.get(field)
-            if isinstance(val, (int, float)) and val > 0:
-                dispatched_24h = int(val)
-                break
+        def _pick_int(keys):
+            for k in keys:
+                v = data_ci.get(k.lower().strip())
+                if v is None:
+                    continue
+                try:
+                    iv = int(float(v))
+                    if iv > 0:
+                        return iv
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        # "Направлено за последний час" — current throughput (cars/hour)
+        dispatched_1h = _pick_int([
+            "направлено за последний час",
+            "carSentLastHour", "sentLastHour", "passed1h",
+        ])
+
+        # "Направлено за последние 24 часа" — daily total
+        dispatched_24h = _pick_int([
+            "направлено за последние 24 часа",
+            "carSentCount", "carPassedCount", "passedCount",
+            "sentCount", "dispatchedCount", "carDispatched",
+            "carSent", "passed24h", "sent24h",
+        ])
 
         # Scalar fields for diagnostics (everything that is not a list/dict)
         scalar_fields = {
@@ -274,6 +287,23 @@ def normalize_reg(reg: str) -> str:
     return re.sub(r'[\s\-.]', '', reg).upper()
 
 
+def _item_matches(item, norm_reg: str) -> bool:
+    """Check whether a queue item (dict or plain string) matches a normalized reg number."""
+    if isinstance(item, dict):
+        # Try every known field name
+        for field in _CAR_REG_FIELDS:
+            val = str(item.get(field) or "")
+            if val and normalize_reg(val) == norm_reg:
+                return True
+        # Also try ALL string-valued fields as a fallback
+        for val in item.values():
+            if isinstance(val, str) and normalize_reg(val) == norm_reg:
+                return True
+    elif isinstance(item, str):
+        return normalize_reg(item) == norm_reg
+    return False
+
+
 def find_car_in_queue(
     norm_reg: str,
     live_queue: list,
@@ -285,17 +315,11 @@ def find_car_in_queue(
     is_called is True when car is in the priority (called-to-checkpoint) queue.
     """
     for item in (priority_queue or []):
-        if isinstance(item, dict):
-            for field in _CAR_REG_FIELDS:
-                val = str(item.get(field) or "")
-                if val and normalize_reg(val) == norm_reg:
-                    return None, True
+        if _item_matches(item, norm_reg):
+            return None, True
     for i, item in enumerate(live_queue or []):
-        if isinstance(item, dict):
-            for field in _CAR_REG_FIELDS:
-                val = str(item.get(field) or "")
-                if val and normalize_reg(val) == norm_reg:
-                    return i + 1, False
+        if _item_matches(item, norm_reg):
+            return i + 1, False
     return None, False
 
 
@@ -466,23 +490,37 @@ def monitor_loop():
                 if is_called and not called_notified:
                     send_notification(
                         chat_id,
-                        f"🟢 *Ваш автомобиль вызван на досмотр!*\n\n"
+                        f"🟢 *Ваш автомобиль вызван на пункт пропуска!*\n\n"
                         f"*{norm_reg}* — подъезжайте к пункту пропуска прямо сейчас!",
                         parse_mode='Markdown',
                     )
                     new_state["called_notified"] = True
                     changed = True
                 elif pos is not None:
-                    for milestone in CAR_MILESTONES:
-                        if pos <= milestone and milestone not in milestones_done:
+                    # Milestones already entered but not yet recorded
+                    applicable = [m for m in CAR_MILESTONES
+                                  if pos <= m and m not in milestones_done]
+                    if applicable:
+                        if not milestones_done:
+                            # First ever detection — just report current position,
+                            # no milestone fanfare; skip past all higher milestones silently.
+                            send_notification(
+                                chat_id,
+                                f"🚗 *{norm_reg}* найден в очереди\n\n"
+                                f"Текущая позиция: *{pos}*",
+                                parse_mode='Markdown',
+                            )
+                        else:
+                            # Car crossed into a new milestone zone
+                            notify_ms = min(applicable)
                             send_notification(
                                 chat_id,
                                 f"🚗 *{norm_reg}* — *{pos}-е место* в очереди\n\n"
-                                f"Рубеж ≤ {milestone} достигнут.",
+                                f"Рубеж ≤ {notify_ms}.",
                                 parse_mode='Markdown',
                             )
-                            milestones_done.append(milestone)
-                            changed = True
+                        milestones_done.extend(applicable)
+                        changed = True
                     new_state["milestones_done"] = milestones_done
                 updated[norm_reg] = new_state
 
@@ -1217,7 +1255,7 @@ def _cars_status_text(cfg: dict, queue: dict | None) -> str:
             "🚗 *Отслеживание автомобилей*\n\n"
             "Добавьте номер — бот будет присылать уведомления когда\n"
             "автомобиль окажется на позиции 300, 200, 100, 50, 25, 10\n"
-            "и когда его вызовут на досмотр."
+            "и когда его вызовут на пункт пропуска."
         )
     raw_live = (queue or {}).get("raw_live_queue", [])
     raw_prio = (queue or {}).get("raw_priority_queue", [])
@@ -1226,7 +1264,7 @@ def _cars_status_text(cfg: dict, queue: dict | None) -> str:
         pos, is_called = find_car_in_queue(norm_reg, raw_live, raw_prio)
         done = state.get("milestones_done", [])
         if is_called:
-            status = "🟢 вызван на досмотр"
+            status = "🟢 вызван на пункт пропуска"
         elif pos is not None:
             next_ms = next((m for m in CAR_MILESTONES if m >= pos and m not in done), None)
             status = f"позиция *{pos}*" + (f" → след. уведомление ≤{next_ms}" if next_ms else "")
@@ -1332,7 +1370,7 @@ def _receive_car_number(message):
     pos, is_called = find_car_in_queue(norm, raw_live, raw_prio)
 
     if is_called:
-        pos_str = "🟢 уже вызван на досмотр!"
+        pos_str = "🟢 уже вызван на пункт пропуска!"
     elif pos is not None:
         pos_str = f"сейчас на позиции *{pos}*"
     else:
