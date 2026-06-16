@@ -64,12 +64,16 @@ DEFAULT_SETTINGS = {
     "enabled": False,
     "interval": 5,
     "last_checked": 0,
-    "step": 50,           # notify every N-car increase
-    "notified_step": 0,   # last step bucket we notified at (cars // step)
+    "step": 50,             # notify when queue grows by this many cars
+    "step_baseline": None,  # queue value when last step-alert fired (None = not set yet)
+    "threshold_notified": False,  # True while queue is above threshold (prevents repeat alerts)
     "paused_until": 0,    # unix timestamp; 0 = not paused
     "planner_target": None,    # "YYYY-MM-DD HH:MM" or None
     "planner_notified": False, # True once the "register now" alert was sent
+    "notification_msg_ids": [], # message IDs of sent notifications (for cleanup)
 }
+
+MAX_NOTIFICATIONS = 5  # keep only last N notification messages per chat
 
 PAUSE_OPTIONS = [
     (1,  "1 час"),
@@ -104,6 +108,30 @@ def update_chat_settings(chat_id: str, **kwargs):
         save_settings(settings)
 
 
+# ── Notification helpers ──────────────────────────────────────────────────────
+
+def send_notification(chat_id: str, text: str, **kwargs) -> None:
+    """Send a notification and keep only the last MAX_NOTIFICATIONS per chat.
+    Older messages are deleted automatically."""
+    try:
+        msg = bot.send_message(int(chat_id), text, **kwargs)
+    except Exception:
+        return
+    with settings_lock:
+        if chat_id not in settings:
+            settings[chat_id] = dict(DEFAULT_SETTINGS)
+        ids: list = list(settings[chat_id].get("notification_msg_ids", []))
+        ids.append(msg.message_id)
+        while len(ids) > MAX_NOTIFICATIONS:
+            old_id = ids.pop(0)
+            try:
+                bot.delete_message(int(chat_id), old_id)
+            except Exception:
+                pass
+        settings[chat_id]["notification_msg_ids"] = ids
+        save_settings(settings)
+
+
 # ── Queue history ────────────────────────────────────────────────────────────
 
 _history_lock = threading.Lock()
@@ -118,6 +146,7 @@ def _load_history() -> list:
     return []
 
 queue_history: list = _load_history()   # [[ts, cars], ...]
+_api_dispatched_24h: int | None = None  # "направлено за 24ч" from API
 
 
 def add_history_point(ts: float, cars: int):
@@ -134,7 +163,14 @@ def add_history_point(ts: float, cars: int):
 
 
 def calc_throughput() -> float | None:
-    """Estimate cars/hour throughput using periods when queue was decreasing."""
+    """Estimate cars/hour throughput.
+    Prefers the official '24h dispatched' counter from the API; falls back
+    to computing it from queue-decrease periods in local history."""
+    # Primary: official API value (559 направлено / 24 ч → cars/hour)
+    if _api_dispatched_24h and _api_dispatched_24h > 0:
+        return _api_dispatched_24h / 24.0
+
+    # Fallback: derive from queue history
     with _history_lock:
         pts = list(queue_history)
     if len(pts) < 10:
@@ -148,7 +184,6 @@ def calc_throughput() -> float | None:
     if len(rates) < 5:
         return None
     rates.sort()
-    # Use median to avoid outliers
     return rates[len(rates) // 2]
 
 
@@ -179,11 +214,31 @@ def fetch_queue() -> dict | None:
         cars_prio = len(data.get("carPriority") or [])
         motos = (len(data.get("motorcycleLiveQueue") or [])
                  + len(data.get("motorcyclePriority") or []))
+
+        # Try common field names for "dispatched in last 24h" counter
+        dispatched_24h = None
+        for field in ("направлено за последние 24 часа",
+                      "carSentCount", "carPassedCount", "passedCount",
+                      "sentCount", "dispatchedCount", "carDispatched",
+                      "carSent", "passed24h", "sent24h"):
+            val = data.get(field)
+            if isinstance(val, (int, float)) and val > 0:
+                dispatched_24h = int(val)
+                break
+
+        # Scalar fields for diagnostics (everything that is not a list/dict)
+        scalar_fields = {
+            k: v for k, v in data.items()
+            if not isinstance(v, (list, dict))
+        }
+
         return {
-            "cars_total": cars_live + cars_prio,
-            "cars_live":  cars_live,
-            "cars_prio":  cars_prio,
-            "motos":      motos,
+            "cars_total":     cars_live + cars_prio,
+            "cars_live":      cars_live,
+            "cars_prio":      cars_prio,
+            "motos":          motos,
+            "dispatched_24h": dispatched_24h,
+            "scalar_fields":  scalar_fields,
         }
     except Exception:
         return None
@@ -213,6 +268,10 @@ def monitor_loop():
         queue = fetch_queue()
         if queue is not None:
             add_history_point(now, queue["cars_total"])
+            # Keep the official 24h throughput counter up to date
+            global _api_dispatched_24h
+            if queue.get("dispatched_24h"):
+                _api_dispatched_24h = queue["dispatched_24h"]
 
         with settings_lock:
             snapshot = {cid: dict(cfg) for cid, cfg in settings.items()}
@@ -234,39 +293,40 @@ def monitor_loop():
                 cars_count = queue["cars_total"]
                 updates = {}
 
-                # ── Threshold alert ──────────────────────────────────────
+                # ── Threshold alert (fires once when crossed, resets when drops below) ──
                 threshold = cfg.get("threshold", 50)
-                if cars_count >= threshold:
-                    try:
-                        bot.send_message(
-                            int(chat_id),
-                            f"⚠️ *Внимание!* Очередь в Бресте ≥ порога *{threshold}* авто.\n\n"
-                            + format_queue(queue),
-                            parse_mode='Markdown'
-                        )
-                    except Exception:
-                        pass
+                threshold_notified = cfg.get("threshold_notified", False)
+                if cars_count >= threshold and not threshold_notified:
+                    send_notification(
+                        chat_id,
+                        f"⚠️ *Внимание!* Очередь в Бресте достигла *{cars_count}* авто "
+                        f"(порог: {threshold}).\n\n" + format_queue(queue),
+                        parse_mode='Markdown'
+                    )
+                    updates["threshold_notified"] = True
+                elif cars_count < threshold and threshold_notified:
+                    updates["threshold_notified"] = False  # reset — ready to fire again
 
-                # ── Step alert ───────────────────────────────────────────
+                # ── Step alert (fires when queue grew by `step` since last alert) ──
                 step = cfg.get("step", 50)
-                notified_step = cfg.get("notified_step", 0)
+                baseline = cfg.get("step_baseline")
                 if step > 0:
-                    current_bucket = cars_count // step
-                    if current_bucket > notified_step:
-                        for bucket in range(notified_step + 1, current_bucket + 1):
-                            milestone = bucket * step
-                            try:
-                                bot.send_message(
-                                    int(chat_id),
-                                    f"📈 *Очередь достигла {milestone} авто!*\n\n"
-                                    + format_queue(queue),
-                                    parse_mode='Markdown'
-                                )
-                            except Exception:
-                                pass
-                        updates["notified_step"] = current_bucket
-                    elif current_bucket < notified_step:
-                        updates["notified_step"] = current_bucket
+                    if baseline is None:
+                        # First check — just record current value, don't alert
+                        updates["step_baseline"] = cars_count
+                    else:
+                        delta = cars_count - baseline
+                        if delta >= step:
+                            send_notification(
+                                chat_id,
+                                f"📈 *Очередь выросла на {delta} авто!*\n\n"
+                                + format_queue(queue),
+                                parse_mode='Markdown'
+                            )
+                            updates["step_baseline"] = cars_count
+                        elif cars_count < baseline:
+                            # Queue dropped — reset baseline to current low point
+                            updates["step_baseline"] = cars_count
 
                 if updates:
                     update_chat_settings(chat_id, **updates)
@@ -302,22 +362,19 @@ def monitor_loop():
 
             # Alert when estimated wait ≥ time to target minus buffer
             if estimated_wait_h >= hours_to_target - PLANNER_ALERT_BUFFER:
-                try:
-                    bot.send_message(
-                        int(chat_id),
-                        f"⏰ *Планировщик: пора вставать в очередь!*\n\n"
-                        f"Желаемый выезд: *{fmt_dt(target_dt)}*\n"
-                        f"Сейчас в очереди: *{cars_now}* авто\n"
-                        f"Пропускная способность: *~{throughput:.0f}* авто/ч\n"
-                        f"Расчётное ожидание: *~{estimated_wait_h:.1f} ч*\n\n"
-                        f"🔴 Зарегистрируйтесь в электронной очереди прямо сейчас!\n"
-                        f"[belarusborder.by](https://belarusborder.by)",
-                        parse_mode='Markdown',
-                        disable_web_page_preview=True,
-                    )
-                    update_chat_settings(chat_id, planner_notified=True)
-                except Exception:
-                    pass
+                send_notification(
+                    chat_id,
+                    f"⏰ *Планировщик: пора вставать в очередь!*\n\n"
+                    f"Желаемый выезд: *{fmt_dt(target_dt)}*\n"
+                    f"Сейчас в очереди: *{cars_now}* авто\n"
+                    f"Пропускная способность: *~{throughput:.0f}* авто/ч\n"
+                    f"Расчётное ожидание: *~{estimated_wait_h:.1f} ч*\n\n"
+                    f"🔴 Зарегистрируйтесь в электронной очереди прямо сейчас!\n"
+                    f"[belarusborder.by](https://belarusborder.by)",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                )
+                update_chat_settings(chat_id, planner_notified=True)
 
 
 threading.Thread(target=monitor_loop, daemon=True).start()
@@ -401,13 +458,19 @@ def source_cmd(message):
         if resp.status_code == 200:
             data = resp.json()
             cars = len(data.get("carLiveQueue") or []) + len(data.get("carPriority") or [])
+            # All scalar fields from API (for finding the 24h dispatched field)
+            scalar_fields = {
+                k: v for k, v in data.items()
+                if not isinstance(v, (list, dict))
+            }
+            fields_text = "\n".join(f"  `{k}`: {v}" for k, v in sorted(scalar_fields.items()))
             bot.reply_to(
                 message,
                 f"✅ *belarusborder.by — доступен*\n\n"
                 f"  Время ответа: *{elapsed:.1f} с*\n"
                 f"  HTTP статус: *{resp.status_code}*\n"
-                f"  Данные получены: *{cars}* авто в очереди\n\n"
-                f"Источник работает нормально 🟢",
+                f"  Авто в очереди: *{cars}*\n\n"
+                f"*Все поля API (не массивы):*\n{fields_text or '  (нет)'}",
                 parse_mode='Markdown'
             )
         else:
@@ -772,7 +835,7 @@ def handle_step_callback(call):
         bot.answer_callback_query(call.id, "Неверное значение.")
         return
 
-    update_chat_settings(chat_id, step=step_val, notified_step=0)
+    update_chat_settings(chat_id, step=step_val, step_baseline=None)
 
     keyboard = telebot.types.InlineKeyboardMarkup(row_width=3)
     buttons = [
