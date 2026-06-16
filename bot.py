@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import threading
@@ -24,6 +25,11 @@ ALLOWED_INTERVALS = {1: "1 минута", 5: "5 минут", 15: "15 минут"
 TICK = 60  # main loop ticks every 60 s; per-user interval is checked individually
 HISTORY_MAX_AGE    = 48 * 3600   # keep 48 h of readings
 PLANNER_ALERT_BUFFER = 0.5       # warn 30 min before calculated register time
+
+CAR_MILESTONES = [300, 200, 100, 50, 25, 10]  # notify at each of these positions
+_CAR_REG_FIELDS = ("regNumber", "carNumber", "registrationNumber",
+                   "number", "plate", "vehicleNumber", "autoNumber", "номер")
+MAX_TRACKED_CARS = 5
 
 MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
              "июля","августа","сентября","октября","ноября","декабря"]
@@ -71,6 +77,7 @@ DEFAULT_SETTINGS = {
     "planner_target": None,    # "YYYY-MM-DD HH:MM" or None
     "planner_notified": False, # True once the "register now" alert was sent
     "notification_msg_ids": [], # message IDs of sent notifications (for cleanup)
+    "tracked_cars": {},         # {normalized_reg: {"milestones_done": [], "called_notified": False}}
 }
 
 MAX_NOTIFICATIONS = 5  # keep only last N notification messages per chat
@@ -147,6 +154,7 @@ def _load_history() -> list:
 
 queue_history: list = _load_history()   # [[ts, cars], ...]
 _api_dispatched_24h: int | None = None  # "направлено за 24ч" from API
+_api_dispatched_1h:  int | None = None  # "направлено за последний час" from API
 
 
 def add_history_point(ts: float, cars: int):
@@ -162,29 +170,34 @@ def add_history_point(ts: float, cars: int):
             pass
 
 
-def calc_throughput() -> float | None:
-    """Estimate cars/hour throughput.
-    Prefers the official '24h dispatched' counter from the API; falls back
-    to computing it from queue-decrease periods in local history."""
-    # Primary: official API value (559 направлено / 24 ч → cars/hour)
-    if _api_dispatched_24h and _api_dispatched_24h > 0:
-        return _api_dispatched_24h / 24.0
+def calc_throughput() -> tuple[float | None, str]:
+    """Estimate cars/hour throughput. Returns (cars_per_hour, source_label).
+    Priority: 1h API value → 24h API value → local history."""
+    # Best: current hour (most reflects live pace)
+    if _api_dispatched_1h and _api_dispatched_1h > 0:
+        return float(_api_dispatched_1h), f"за посл. час ({_api_dispatched_1h} авто/ч)"
 
-    # Fallback: derive from queue history
+    # Good: 24h average
+    if _api_dispatched_24h and _api_dispatched_24h > 0:
+        rate = _api_dispatched_24h / 24.0
+        return rate, f"среднее за 24ч (~{rate:.0f} авто/ч)"
+
+    # Fallback: derive from local queue history
     with _history_lock:
         pts = list(queue_history)
     if len(pts) < 10:
-        return None
+        return None, "недостаточно данных"
     rates = []
     for i in range(1, len(pts)):
         dt = pts[i][0] - pts[i - 1][0]
-        dc = pts[i - 1][1] - pts[i][1]   # positive = queue shrank
+        dc = pts[i - 1][1] - pts[i][1]
         if dt > 0 and dc > 0:
             rates.append(dc / dt * 3600)
     if len(rates) < 5:
-        return None
+        return None, "недостаточно данных"
     rates.sort()
-    return rates[len(rates) // 2]
+    rate = rates[len(rates) // 2]
+    return rate, f"из истории (~{rate:.0f} авто/ч)"
 
 
 def history_stats() -> dict:
@@ -215,7 +228,16 @@ def fetch_queue() -> dict | None:
         motos = (len(data.get("motorcycleLiveQueue") or [])
                  + len(data.get("motorcyclePriority") or []))
 
-        # Try common field names for "dispatched in last 24h" counter
+        # "Направлено за последний час" — current throughput (cars/hour)
+        dispatched_1h = None
+        for field in ("направлено за последний час",
+                      "carSentLastHour", "sentLastHour", "passed1h"):
+            val = data.get(field)
+            if isinstance(val, (int, float)) and val > 0:
+                dispatched_1h = int(val)
+                break
+
+        # "Направлено за последние 24 часа" — daily average throughput
         dispatched_24h = None
         for field in ("направлено за последние 24 часа",
                       "carSentCount", "carPassedCount", "passedCount",
@@ -233,15 +255,48 @@ def fetch_queue() -> dict | None:
         }
 
         return {
-            "cars_total":     cars_live + cars_prio,
-            "cars_live":      cars_live,
-            "cars_prio":      cars_prio,
-            "motos":          motos,
-            "dispatched_24h": dispatched_24h,
-            "scalar_fields":  scalar_fields,
+            "cars_total":        cars_live + cars_prio,
+            "cars_live":         cars_live,
+            "cars_prio":         cars_prio,
+            "motos":             motos,
+            "dispatched_1h":     dispatched_1h,
+            "dispatched_24h":    dispatched_24h,
+            "scalar_fields":     scalar_fields,
+            "raw_live_queue":    data.get("carLiveQueue") or [],
+            "raw_priority_queue": data.get("carPriority") or [],
         }
     except Exception:
         return None
+
+
+def normalize_reg(reg: str) -> str:
+    """Uppercase + strip spaces, dashes, dots → canonical form for comparison."""
+    return re.sub(r'[\s\-.]', '', reg).upper()
+
+
+def find_car_in_queue(
+    norm_reg: str,
+    live_queue: list,
+    priority_queue: list,
+) -> tuple[int | None, bool]:
+    """Return (position_1based, is_called).
+
+    position is None if not in live queue.
+    is_called is True when car is in the priority (called-to-checkpoint) queue.
+    """
+    for item in (priority_queue or []):
+        if isinstance(item, dict):
+            for field in _CAR_REG_FIELDS:
+                val = str(item.get(field) or "")
+                if val and normalize_reg(val) == norm_reg:
+                    return None, True
+    for i, item in enumerate(live_queue or []):
+        if isinstance(item, dict):
+            for field in _CAR_REG_FIELDS:
+                val = str(item.get(field) or "")
+                if val and normalize_reg(val) == norm_reg:
+                    return i + 1, False
+    return None, False
 
 
 def format_queue(q: dict) -> str:
@@ -268,10 +323,11 @@ def monitor_loop():
         queue = fetch_queue()
         if queue is not None:
             add_history_point(now, queue["cars_total"])
-            # Keep the official 24h throughput counter up to date
-            global _api_dispatched_24h
+            global _api_dispatched_24h, _api_dispatched_1h
             if queue.get("dispatched_24h"):
                 _api_dispatched_24h = queue["dispatched_24h"]
+            if queue.get("dispatched_1h"):
+                _api_dispatched_1h = queue["dispatched_1h"]
 
         with settings_lock:
             snapshot = {cid: dict(cfg) for cid, cfg in settings.items()}
@@ -335,7 +391,7 @@ def monitor_loop():
         if queue is None:
             continue
 
-        throughput = calc_throughput()
+        throughput, tp_label = calc_throughput()
         cars_now = queue["cars_total"]
 
         for chat_id, cfg in snapshot.items():
@@ -355,6 +411,21 @@ def monitor_loop():
                 update_chat_settings(chat_id, planner_target=None, planner_notified=False)
                 continue
 
+            # Special case: queue is empty — ideal moment, alert immediately
+            if cars_now == 0 and hours_to_target > 0:
+                send_notification(
+                    chat_id,
+                    f"🟢 *Планировщик: очередь пуста — лучший момент для выезда!*\n\n"
+                    f"Желаемый выезд: *{fmt_dt(target_dt)}*\n"
+                    f"Сейчас в очереди: *0 авто* 🎉\n\n"
+                    f"🔴 Зарегистрируйтесь в электронной очереди прямо сейчас!\n"
+                    f"[belarusborder.by](https://belarusborder.by)",
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                )
+                update_chat_settings(chat_id, planner_notified=True)
+                continue
+
             if throughput is None or throughput <= 0:
                 continue
 
@@ -367,7 +438,7 @@ def monitor_loop():
                     f"⏰ *Планировщик: пора вставать в очередь!*\n\n"
                     f"Желаемый выезд: *{fmt_dt(target_dt)}*\n"
                     f"Сейчас в очереди: *{cars_now}* авто\n"
-                    f"Пропускная способность: *~{throughput:.0f}* авто/ч\n"
+                    f"Пропускная способность: *{tp_label}*\n"
                     f"Расчётное ожидание: *~{estimated_wait_h:.1f} ч*\n\n"
                     f"🔴 Зарегистрируйтесь в электронной очереди прямо сейчас!\n"
                     f"[belarusborder.by](https://belarusborder.by)",
@@ -375,6 +446,48 @@ def monitor_loop():
                     disable_web_page_preview=True,
                 )
                 update_chat_settings(chat_id, planner_notified=True)
+
+        # ── Car position tracking ──────────────────────────────────────────────
+        raw_live = queue.get("raw_live_queue", [])
+        raw_prio = queue.get("raw_priority_queue", [])
+
+        for chat_id, cfg in snapshot.items():
+            tracked = cfg.get("tracked_cars")
+            if not tracked:
+                continue
+            updated = dict(tracked)
+            changed = False
+            for norm_reg, state in list(tracked.items()):
+                pos, is_called = find_car_in_queue(norm_reg, raw_live, raw_prio)
+                milestones_done = list(state.get("milestones_done", []))
+                called_notified = state.get("called_notified", False)
+                new_state = dict(state)
+
+                if is_called and not called_notified:
+                    send_notification(
+                        chat_id,
+                        f"🟢 *Ваш автомобиль вызван на досмотр!*\n\n"
+                        f"*{norm_reg}* — подъезжайте к пункту пропуска прямо сейчас!",
+                        parse_mode='Markdown',
+                    )
+                    new_state["called_notified"] = True
+                    changed = True
+                elif pos is not None:
+                    for milestone in CAR_MILESTONES:
+                        if pos <= milestone and milestone not in milestones_done:
+                            send_notification(
+                                chat_id,
+                                f"🚗 *{norm_reg}* — *{pos}-е место* в очереди\n\n"
+                                f"Рубеж ≤ {milestone} достигнут.",
+                                parse_mode='Markdown',
+                            )
+                            milestones_done.append(milestone)
+                            changed = True
+                    new_state["milestones_done"] = milestones_done
+                updated[norm_reg] = new_state
+
+            if changed:
+                update_chat_settings(chat_id, tracked_cars=updated)
 
 
 threading.Thread(target=monitor_loop, daemon=True).start()
@@ -464,13 +577,25 @@ def source_cmd(message):
                 if not isinstance(v, (list, dict))
             }
             fields_text = "\n".join(f"  `{k}`: {v}" for k, v in sorted(scalar_fields.items()))
+            # Show first queue element to reveal the registration field name
+            live_queue = data.get("carLiveQueue") or []
+            first_item_text = ""
+            if live_queue:
+                first = live_queue[0]
+                if isinstance(first, dict):
+                    first_item_text = "\n\n*Первый элемент carLiveQueue:*\n" + "\n".join(
+                        f"  `{k}`: `{v}`" for k, v in first.items() if not isinstance(v, (dict, list))
+                    )
+                else:
+                    first_item_text = f"\n\n*carLiveQueue[0]*: `{str(first)[:300]}`"
             bot.reply_to(
                 message,
                 f"✅ *belarusborder.by — доступен*\n\n"
                 f"  Время ответа: *{elapsed:.1f} с*\n"
                 f"  HTTP статус: *{resp.status_code}*\n"
                 f"  Авто в очереди: *{cars}*\n\n"
-                f"*Все поля API (не массивы):*\n{fields_text or '  (нет)'}",
+                f"*Все поля API (не массивы):*\n{fields_text or '  (нет)'}"
+                f"{first_item_text}",
                 parse_mode='Markdown'
             )
         else:
@@ -784,6 +909,37 @@ def handle_pause_callback(call):
     bot.answer_callback_query(call.id, f"Пауза на {label}")
 
 
+@bot.message_handler(commands=['reset'])
+def reset_cmd(message):
+    chat_id = str(message.chat.id)
+    cfg = get_chat_settings(chat_id)
+    ids = cfg.get("notification_msg_ids", [])
+    deleted = 0
+    for mid in ids:
+        try:
+            bot.delete_message(int(chat_id), mid)
+            deleted += 1
+        except Exception:
+            pass
+    # Also reset car tracking milestones (keep the car list, just clear progress)
+    cfg2 = get_chat_settings(chat_id)
+    tracked = cfg2.get("tracked_cars", {})
+    reset_tracked = {r: {"milestones_done": [], "called_notified": False} for r in tracked}
+    update_chat_settings(
+        chat_id,
+        notification_msg_ids=[],
+        step_baseline=None,
+        threshold_notified=False,
+        planner_notified=False,
+        tracked_cars=reset_tracked,
+    )
+    bot.reply_to(
+        message,
+        f"🗑 Удалено *{deleted}* уведомлений. Состояние сброшено — счётчики начнут с нуля.",
+        parse_mode='Markdown'
+    )
+
+
 @bot.message_handler(commands=['resume'])
 def resume_cmd(message):
     chat_id = str(message.chat.id)
@@ -890,8 +1046,8 @@ def _planner_status_text(cfg: dict) -> str:
         return "📅 *Планировщик* не настроен."
     notified = cfg.get("planner_notified", False)
     status = "✅ уведомление отправлено" if notified else "⏳ ожидаю подходящего момента"
-    tp = calc_throughput()
-    tp_str = f"~{tp:.0f} авто/ч" if tp else "накапливается история…"
+    tp, tp_label = calc_throughput()
+    tp_str = tp_label if tp else "накапливается история…"
     return (
         f"📅 *Планировщик активен*\n\n"
         f"  Желаемый выезд: *{fmt_dt(dt)}*\n"
@@ -1034,8 +1190,8 @@ def _receive_planner_time(message):
     target_str = target_dt.strftime("%Y-%m-%d %H:%M")
     update_chat_settings(chat_id, planner_target=target_str, planner_notified=False)
 
-    tp = calc_throughput()
-    tp_str = (f"\n\nПропускная способность сейчас: *~{tp:.0f}* авто/ч — данных достаточно 👍"
+    tp, tp_label = calc_throughput()
+    tp_str = (f"\n\nПропускная способность: *{tp_label}* — данных достаточно 👍"
               if tp else
               "\n\n⚠️ Истории очереди пока мало (накапливается). Точность расчёта улучшится через несколько часов работы бота.")
 
@@ -1046,6 +1202,150 @@ def _receive_planner_time(message):
         f"Бот рассчитает, когда нужно встать в электронную очередь, и пришлёт уведомление.{tp_str}\n\n"
         f"Отменить: /planner → «Отменить план»",
         parse_mode='Markdown'
+    )
+
+
+# ── Car tracking ─────────────────────────────────────────────────────────────
+
+_cars_pending: dict = {}  # chat_id → pending state (currently unused, reserved)
+
+
+def _cars_status_text(cfg: dict, queue: dict | None) -> str:
+    tracked = cfg.get("tracked_cars", {})
+    if not tracked:
+        return (
+            "🚗 *Отслеживание автомобилей*\n\n"
+            "Добавьте номер — бот будет присылать уведомления когда\n"
+            "автомобиль окажется на позиции 300, 200, 100, 50, 25, 10\n"
+            "и когда его вызовут на досмотр."
+        )
+    raw_live = (queue or {}).get("raw_live_queue", [])
+    raw_prio = (queue or {}).get("raw_priority_queue", [])
+    lines = ["🚗 *Отслеживаемые автомобили:*\n"]
+    for norm_reg, state in tracked.items():
+        pos, is_called = find_car_in_queue(norm_reg, raw_live, raw_prio)
+        done = state.get("milestones_done", [])
+        if is_called:
+            status = "🟢 вызван на досмотр"
+        elif pos is not None:
+            next_ms = next((m for m in CAR_MILESTONES if m >= pos and m not in done), None)
+            status = f"позиция *{pos}*" + (f" → след. уведомление ≤{next_ms}" if next_ms else "")
+        else:
+            status = "❓ не найден в очереди"
+        lines.append(f"  *{norm_reg}* — {status}")
+    return "\n".join(lines)
+
+
+def _cars_keyboard(cfg: dict) -> telebot.types.InlineKeyboardMarkup:
+    tracked = cfg.get("tracked_cars", {})
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    if len(tracked) < MAX_TRACKED_CARS:
+        kb.add(telebot.types.InlineKeyboardButton("➕ Добавить автомобиль", callback_data="cars:add"))
+    for norm_reg in tracked:
+        kb.add(telebot.types.InlineKeyboardButton(f"❌ Удалить {norm_reg}", callback_data=f"cars:del:{norm_reg}"))
+    return kb
+
+
+@bot.message_handler(commands=['cars'])
+def cars_cmd(message):
+    chat_id = str(message.chat.id)
+    cfg = get_chat_settings(chat_id)
+    queue = fetch_queue()
+    bot.reply_to(
+        message,
+        _cars_status_text(cfg, queue),
+        reply_markup=_cars_keyboard(cfg),
+        parse_mode='Markdown'
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cars:"))
+def handle_cars_callback(call):
+    chat_id = str(call.message.chat.id)
+    parts = call.data.split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    bot.answer_callback_query(call.id)
+
+    cfg = get_chat_settings(chat_id)
+
+    if action == "add":
+        sent = bot.send_message(
+            chat_id,
+            "✏️ Введите номер автомобиля\n(например: *1234 AB-7* или *AB 1234-7*):",
+            parse_mode='Markdown'
+        )
+        bot.register_next_step_handler(sent, _receive_car_number)
+        return
+
+    if action == "del" and len(parts) == 3:
+        norm_reg = parts[2]
+        tracked = dict(cfg.get("tracked_cars", {}))
+        if norm_reg in tracked:
+            del tracked[norm_reg]
+            update_chat_settings(chat_id, tracked_cars=tracked)
+            cfg = get_chat_settings(chat_id)
+
+    queue = fetch_queue()
+    try:
+        bot.edit_message_text(
+            _cars_status_text(cfg, queue),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=_cars_keyboard(cfg),
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+
+def _receive_car_number(message):
+    chat_id = str(message.chat.id)
+    raw = (message.text or "").strip()
+    norm = normalize_reg(raw)
+
+    if len(norm) < 3 or len(norm) > 15:
+        msg = bot.reply_to(
+            message,
+            "⚠️ Не похоже на номер авто. Попробуйте ещё раз\n(например: *1234 AB-7*):",
+            parse_mode='Markdown'
+        )
+        bot.register_next_step_handler(msg, _receive_car_number)
+        return
+
+    cfg = get_chat_settings(chat_id)
+    tracked = dict(cfg.get("tracked_cars", {}))
+
+    if len(tracked) >= MAX_TRACKED_CARS:
+        bot.reply_to(message, f"⚠️ Можно отслеживать не более {MAX_TRACKED_CARS} автомобилей. Удалите один через /cars.")
+        return
+
+    if norm in tracked:
+        bot.reply_to(message, f"ℹ️ *{norm}* уже в списке отслеживания.", parse_mode='Markdown')
+        return
+
+    tracked[norm] = {"milestones_done": [], "called_notified": False}
+    update_chat_settings(chat_id, tracked_cars=tracked)
+
+    queue = fetch_queue()
+    raw_live = (queue or {}).get("raw_live_queue", [])
+    raw_prio = (queue or {}).get("raw_priority_queue", [])
+    pos, is_called = find_car_in_queue(norm, raw_live, raw_prio)
+
+    if is_called:
+        pos_str = "🟢 уже вызван на досмотр!"
+    elif pos is not None:
+        pos_str = f"сейчас на позиции *{pos}*"
+    else:
+        pos_str = "в очереди *не найден* (возможно ещё не зарегистрирован)"
+
+    bot.reply_to(
+        message,
+        f"✅ *{norm}* добавлен.\n\n"
+        f"Статус: {pos_str}\n\n"
+        f"Уведомления придут на позициях:\n"
+        f"300 → 200 → 100 → 50 → 25 → 10 → *вызван*",
+        parse_mode='Markdown',
+        reply_markup=_cars_keyboard(get_chat_settings(chat_id))
     )
 
 
@@ -1065,7 +1365,9 @@ if __name__ == '__main__':
         telebot.types.BotCommand("setinterval",   "🕐 Частота проверки"),
         telebot.types.BotCommand("set_threshold", "🎯 Задать порог"),
         telebot.types.BotCommand("threshold",     "📊 Мои настройки"),
+        telebot.types.BotCommand("cars",          "🚗 Отслеживать авто в очереди"),
         telebot.types.BotCommand("planner",       "📅 Планировщик выезда"),
+        telebot.types.BotCommand("reset",         "🗑 Удалить уведомления и сбросить счётчики"),
         telebot.types.BotCommand("source",        "🔌 Статус источника данных"),
         telebot.types.BotCommand("help",          "ℹ️ Справка"),
     ])
