@@ -1,11 +1,20 @@
 import os
 import re
+import sys
 import json
 import time
 import threading
 import datetime
+import subprocess
 import requests
 import telebot
+
+# Auto-install optional packages that may be missing in the deployed image
+try:
+    import bs4  # noqa: F401
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "beautifulsoup4"])
+    import bs4  # noqa: F401
 
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
