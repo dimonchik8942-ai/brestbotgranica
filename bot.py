@@ -27,7 +27,7 @@ HISTORY_MAX_AGE    = 48 * 3600   # keep 48 h of readings
 PLANNER_ALERT_BUFFER = 0.5       # warn 30 min before calculated register time
 
 CAR_MILESTONES = [300, 200, 100, 50, 25, 10]  # notify at each of these positions
-_CAR_REG_FIELDS = ("regNumber", "carNumber", "registrationNumber",
+_CAR_REG_FIELDS = ("regnum", "regNumber", "carNumber", "registrationNumber",
                    "number", "plate", "vehicleNumber", "autoNumber",
                    "gosNomer", "gosNumber", "nomer", "avtoNomer",
                    "regNomer", "carNomer", "номер", "гос_номер",
@@ -626,6 +626,30 @@ def source_cmd(message):
                     )
                 else:
                     first_item_text = f"\n\n*carLiveQueue[0]*: `{str(first)[:300]}`"
+
+            # Show structure of all other top-level keys (for finding throughput)
+            other_keys_text = ""
+            skip = {"carLiveQueue", "carPriority", "motorcycleLiveQueue", "motorcyclePriority"}
+            other_lines = []
+            for k, v in data.items():
+                if k in skip:
+                    continue
+                if isinstance(v, list) and v:
+                    first_el = v[0]
+                    if isinstance(first_el, dict):
+                        preview = ", ".join(f"{fk}={fv}" for fk, fv in first_el.items())
+                        other_lines.append(f"  `{k}` (список): {{{preview}}}")
+                    else:
+                        other_lines.append(f"  `{k}` (список): `{str(first_el)[:120]}`")
+                elif isinstance(v, dict):
+                    # Show ALL fields of nested dicts
+                    for fk, fv in v.items():
+                        other_lines.append(f"  `{k}.{fk}`: `{fv}`")
+                elif v is not None and v != [] and v != {}:
+                    other_lines.append(f"  `{k}`: `{v}`")
+            if other_lines:
+                other_keys_text = "\n\n*Прочие поля API:*\n" + "\n".join(other_lines)
+
             bot.reply_to(
                 message,
                 f"✅ *belarusborder.by — доступен*\n\n"
@@ -633,7 +657,8 @@ def source_cmd(message):
                 f"  HTTP статус: *{resp.status_code}*\n"
                 f"  Авто в очереди: *{cars}*\n\n"
                 f"*Все поля API (не массивы):*\n{fields_text or '  (нет)'}"
-                f"{first_item_text}",
+                f"{first_item_text}"
+                f"{other_keys_text}",
                 parse_mode='Markdown'
             )
         else:
@@ -673,6 +698,56 @@ def source_cmd(message):
             f"  Время: *{elapsed:.1f} с*",
             parse_mode='Markdown'
         )
+
+
+@bot.message_handler(commands=['debug_stats'])
+def debug_stats(message):
+    """Probe known belarusborder.by endpoints to find throughput data."""
+    import time as _time
+    chat_id = str(message.chat.id)
+    bot.reply_to(message, "🔍 Проверяю эндпоинты для данных о пропускной способности…")
+    candidates = [
+        ("monitoring-new (текущий)", "https://belarusborder.by/info/monitoring-new"),
+        ("monitoring",               "https://belarusborder.by/info/monitoring"),
+        ("checkpoint",               "https://belarusborder.by/info/checkpoint"),
+        ("statistics",               "https://belarusborder.by/info/statistics"),
+        ("statistic",                "https://belarusborder.by/info/statistic"),
+        ("monitoring-stats",         "https://belarusborder.by/info/monitoring-stats"),
+        ("checkpoint-info",          "https://belarusborder.by/info/checkpoint-info"),
+    ]
+    params = {"token": BTS_TOKEN, "checkpointId": BREST_CHECKPOINT_ID}
+    lines = []
+    for label, url in candidates:
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+            if r.status_code == 200:
+                try:
+                    d = r.json()
+                    # Collect all scalar values including inside dicts (1 level deep)
+                    scalars = {}
+                    for k, v in d.items():
+                        if not isinstance(v, (list, dict)):
+                            scalars[k] = v
+                        elif isinstance(v, dict):
+                            for sk, sv in v.items():
+                                if not isinstance(sv, (list, dict)):
+                                    scalars[f"{k}.{sk}"] = sv
+                    # Filter for fields that look like throughput numbers
+                    interesting = {k: v for k, v in scalars.items()
+                                   if isinstance(v, (int, float)) and v > 0
+                                   or (isinstance(v, str) and any(w in k.lower() for w in
+                                       ("sent", "pass", "direct", "час", "24", "напр")))}
+                    top_keys = list(d.keys())[:8]
+                    lines.append(f"✅ *{label}* ({r.status_code})\n"
+                                 f"  Ключи: {top_keys}\n"
+                                 f"  Числа: {interesting}")
+                except Exception:
+                    lines.append(f"✅ *{label}* ({r.status_code}) — не JSON")
+            else:
+                lines.append(f"❌ *{label}* ({r.status_code})")
+        except Exception as e:
+            lines.append(f"⚠️ *{label}* — {str(e)[:60]}")
+    bot.send_message(chat_id, "\n\n".join(lines) or "Ничего не найдено.", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['enable'])
