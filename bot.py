@@ -175,32 +175,31 @@ def add_history_point(ts: float, cars: int):
 
 def calc_throughput() -> tuple[float | None, str]:
     """Estimate cars/hour throughput. Returns (cars_per_hour, source_label).
-    Priority: 1h API value → 24h API value → local history."""
-    # Best: current hour (most reflects live pace)
+    Priority: 1h API → 24h API → recent local history (last 2h)."""
     if _api_dispatched_1h and _api_dispatched_1h > 0:
         return float(_api_dispatched_1h), f"за посл. час ({_api_dispatched_1h} авто/ч)"
-
-    # Good: 24h average
     if _api_dispatched_24h and _api_dispatched_24h > 0:
         rate = _api_dispatched_24h / 24.0
         return rate, f"среднее за 24ч (~{rate:.0f} авто/ч)"
 
-    # Fallback: derive from local queue history
+    # Fallback: история за последние 2 часа
     with _history_lock:
         pts = list(queue_history)
-    if len(pts) < 10:
-        return None, "недостаточно данных"
+    cutoff = time.time() - 2 * 3600
+    pts = [p for p in pts if p[0] >= cutoff]
+    if len(pts) < 5:
+        return None, "накапливается история…"
     rates = []
     for i in range(1, len(pts)):
         dt = pts[i][0] - pts[i - 1][0]
         dc = pts[i - 1][1] - pts[i][1]
         if dt > 0 and dc > 0:
             rates.append(dc / dt * 3600)
-    if len(rates) < 5:
-        return None, "недостаточно данных"
+    if len(rates) < 3:
+        return None, "накапливается история…"
     rates.sort()
     rate = rates[len(rates) // 2]
-    return rate, f"из истории (~{rate:.0f} авто/ч)"
+    return rate, f"из истории за 2ч (~{rate:.0f} авто/ч)"
 
 
 def history_stats() -> dict:
@@ -214,6 +213,52 @@ def history_stats() -> dict:
 
 
 # ── Data fetching ────────────────────────────────────────────────────────────
+
+def fetch_throughput_from_mon() -> dict | None:
+    """Fetch throughput data from mon.declarant.by website."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://mon.declarant.by/zone/brest-bts",
+            headers=HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, 'html.parser')
+
+        dispatched_1h = None
+        dispatched_24h = None
+
+        for elem in soup.find_all(string=True):
+            text = str(elem).strip()
+            if "Направлено за последний час" in text:
+                parent = elem.parent
+                for el in parent.find_all(string=True):
+                    match = re.search(r'\d+', str(el))
+                    if match:
+                        dispatched_1h = int(match.group())
+                        break
+            if "Направлено за последние 24 часа" in text:
+                parent = elem.parent
+                for el in parent.find_all(string=True):
+                    match = re.search(r'\d+', str(el))
+                    if match:
+                        dispatched_24h = int(match.group())
+                        break
+
+        if dispatched_1h or dispatched_24h:
+            return {
+                "dispatched_1h": dispatched_1h,
+                "dispatched_24h": dispatched_24h,
+            }
+        return None
+    except Exception:
+        return None
+
 
 def fetch_queue() -> dict | None:
     """Fetch real-time queue from belarusborder.by (BTS electronic queue)."""
@@ -339,6 +384,7 @@ def format_queue(q: dict) -> str:
 # interval is checked individually for threshold/step notifications.
 
 def monitor_loop():
+    global _api_dispatched_24h, _api_dispatched_1h
     while True:
         time.sleep(TICK)
         now = time.time()
@@ -347,7 +393,16 @@ def monitor_loop():
         queue = fetch_queue()
         if queue is not None:
             add_history_point(now, queue["cars_total"])
-            global _api_dispatched_24h, _api_dispatched_1h
+
+        # Try to get throughput from mon.declarant.by first
+        mon_data = fetch_throughput_from_mon()
+        if mon_data:
+            if mon_data.get("dispatched_24h"):
+                _api_dispatched_24h = mon_data["dispatched_24h"]
+            if mon_data.get("dispatched_1h"):
+                _api_dispatched_1h = mon_data["dispatched_1h"]
+        # Fallback to belarusborder.by API if mon.declarant.by didn't work
+        elif queue:
             if queue.get("dispatched_24h"):
                 _api_dispatched_24h = queue["dispatched_24h"]
             if queue.get("dispatched_1h"):
@@ -415,8 +470,9 @@ def monitor_loop():
         if queue is None:
             continue
 
-        throughput, tp_label = calc_throughput()
         cars_now = queue["cars_total"]
+
+        throughput, tp_label = calc_throughput()
 
         for chat_id, cfg in snapshot.items():
             target_str = cfg.get("planner_target")
@@ -1460,6 +1516,7 @@ def _receive_car_number(message):
         parse_mode='Markdown',
         reply_markup=_cars_keyboard(get_chat_settings(chat_id))
     )
+
 
 
 @bot.message_handler(func=lambda m: True)
