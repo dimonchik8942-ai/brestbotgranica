@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import datetime
 import requests
 import telebot
 
@@ -17,9 +18,18 @@ BTS_API = "https://belarusborder.by/info/monitoring-new"
 BTS_TOKEN = "test"
 BREST_CHECKPOINT_ID = "a9173a85-3fc0-424c-84f0-defa632481e4"
 
-SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+SETTINGS_FILE  = os.path.join(os.path.dirname(__file__), "settings.json")
+HISTORY_FILE   = os.path.join(os.path.dirname(__file__), "queue_history.json")
 ALLOWED_INTERVALS = {1: "1 минута", 5: "5 минут", 15: "15 минут"}
 TICK = 60  # main loop ticks every 60 s; per-user interval is checked individually
+HISTORY_MAX_AGE    = 48 * 3600   # keep 48 h of readings
+PLANNER_ALERT_BUFFER = 0.5       # warn 30 min before calculated register time
+
+MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
+             "июля","августа","сентября","октября","ноября","декабря"]
+
+def fmt_dt(dt: datetime.datetime) -> str:
+    return f"{dt.day} {MONTHS_RU[dt.month - 1]} в {dt.strftime('%H:%M')}"
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -57,6 +67,8 @@ DEFAULT_SETTINGS = {
     "step": 50,           # notify every N-car increase
     "notified_step": 0,   # last step bucket we notified at (cars // step)
     "paused_until": 0,    # unix timestamp; 0 = not paused
+    "planner_target": None,    # "YYYY-MM-DD HH:MM" or None
+    "planner_notified": False, # True once the "register now" alert was sent
 }
 
 PAUSE_OPTIONS = [
@@ -90,6 +102,64 @@ def update_chat_settings(chat_id: str, **kwargs):
             settings[chat_id] = dict(DEFAULT_SETTINGS)
         settings[chat_id].update(kwargs)
         save_settings(settings)
+
+
+# ── Queue history ────────────────────────────────────────────────────────────
+
+_history_lock = threading.Lock()
+
+def _load_history() -> list:
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+queue_history: list = _load_history()   # [[ts, cars], ...]
+
+
+def add_history_point(ts: float, cars: int):
+    global queue_history
+    cutoff = ts - HISTORY_MAX_AGE
+    with _history_lock:
+        queue_history.append([ts, cars])
+        queue_history = [p for p in queue_history if p[0] >= cutoff]
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(queue_history, f)
+        except Exception:
+            pass
+
+
+def calc_throughput() -> float | None:
+    """Estimate cars/hour throughput using periods when queue was decreasing."""
+    with _history_lock:
+        pts = list(queue_history)
+    if len(pts) < 10:
+        return None
+    rates = []
+    for i in range(1, len(pts)):
+        dt = pts[i][0] - pts[i - 1][0]
+        dc = pts[i - 1][1] - pts[i][1]   # positive = queue shrank
+        if dt > 0 and dc > 0:
+            rates.append(dc / dt * 3600)
+    if len(rates) < 5:
+        return None
+    rates.sort()
+    # Use median to avoid outliers
+    return rates[len(rates) // 2]
+
+
+def history_stats() -> dict:
+    """Return age of oldest point and number of samples."""
+    with _history_lock:
+        pts = list(queue_history)
+    if not pts:
+        return {"samples": 0, "age_h": 0}
+    age_h = (time.time() - pts[0][0]) / 3600
+    return {"samples": len(pts), "age_h": age_h}
 
 
 # ── Data fetching ────────────────────────────────────────────────────────────
@@ -131,82 +201,123 @@ def format_queue(q: dict) -> str:
 
 
 # ── Background monitor ───────────────────────────────────────────────────────
-# Ticks every TICK seconds; each user is checked according to their own interval.
+# Ticks every TICK seconds. Always fetches for history/planner; per-user
+# interval is checked individually for threshold/step notifications.
 
 def monitor_loop():
     while True:
         time.sleep(TICK)
         now = time.time()
 
+        # Always fetch so history & planner work even if no user has alerts on
+        queue = fetch_queue()
+        if queue is not None:
+            add_history_point(now, queue["cars_total"])
+
         with settings_lock:
             snapshot = {cid: dict(cfg) for cid, cfg in settings.items()}
 
-        # Group enabled users by who is due for a check, to avoid redundant fetches
-        due_chats = []
-        for chat_id, cfg in snapshot.items():
-            if not cfg.get("enabled"):
-                continue
-            interval_sec = cfg.get("interval", 5) * 60
-            if now - cfg.get("last_checked", 0) >= interval_sec:
-                due_chats.append((chat_id, cfg))
+        # ── Per-user threshold / step alerts ─────────────────────────────────
+        due_chats = [
+            (cid, cfg) for cid, cfg in snapshot.items()
+            if cfg.get("enabled")
+            and now - cfg.get("last_checked", 0) >= cfg.get("interval", 5) * 60
+        ]
 
-        if not due_chats:
+        if queue is not None and due_chats:
+            for chat_id, cfg in due_chats:
+                update_chat_settings(chat_id, last_checked=now)
+
+                if now < cfg.get("paused_until", 0):
+                    continue
+
+                cars_count = queue["cars_total"]
+                updates = {}
+
+                # ── Threshold alert ──────────────────────────────────────
+                threshold = cfg.get("threshold", 50)
+                if cars_count >= threshold:
+                    try:
+                        bot.send_message(
+                            int(chat_id),
+                            f"⚠️ *Внимание!* Очередь в Бресте ≥ порога *{threshold}* авто.\n\n"
+                            + format_queue(queue),
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        pass
+
+                # ── Step alert ───────────────────────────────────────────
+                step = cfg.get("step", 50)
+                notified_step = cfg.get("notified_step", 0)
+                if step > 0:
+                    current_bucket = cars_count // step
+                    if current_bucket > notified_step:
+                        for bucket in range(notified_step + 1, current_bucket + 1):
+                            milestone = bucket * step
+                            try:
+                                bot.send_message(
+                                    int(chat_id),
+                                    f"📈 *Очередь достигла {milestone} авто!*\n\n"
+                                    + format_queue(queue),
+                                    parse_mode='Markdown'
+                                )
+                            except Exception:
+                                pass
+                        updates["notified_step"] = current_bucket
+                    elif current_bucket < notified_step:
+                        updates["notified_step"] = current_bucket
+
+                if updates:
+                    update_chat_settings(chat_id, **updates)
+
+        # ── Planner check ─────────────────────────────────────────────────────
+        if queue is None:
             continue
 
-        queue = fetch_queue()
-        fetch_time = time.time()
+        throughput = calc_throughput()
+        cars_now = queue["cars_total"]
 
-        for chat_id, cfg in due_chats:
-            update_chat_settings(chat_id, last_checked=fetch_time)
-
-            # Skip if notifications are paused
-            if fetch_time < cfg.get("paused_until", 0):
+        for chat_id, cfg in snapshot.items():
+            target_str = cfg.get("planner_target")
+            if not target_str or cfg.get("planner_notified"):
+                continue
+            try:
+                target_dt = datetime.datetime.strptime(target_str, "%Y-%m-%d %H:%M")
+                target_ts = target_dt.timestamp()
+            except Exception:
                 continue
 
-            if queue is None:
+            hours_to_target = (target_ts - now) / 3600
+
+            # Clean up expired targets (passed more than 2 h ago)
+            if hours_to_target < -2:
+                update_chat_settings(chat_id, planner_target=None, planner_notified=False)
                 continue
-            cars_count = queue["cars_total"]
 
-            updates = {}
+            if throughput is None or throughput <= 0:
+                continue
 
-            # ── Threshold alert ──────────────────────────────────────────
-            threshold = cfg.get("threshold", 50)
-            if cars_count >= threshold:
+            estimated_wait_h = cars_now / throughput
+
+            # Alert when estimated wait ≥ time to target minus buffer
+            if estimated_wait_h >= hours_to_target - PLANNER_ALERT_BUFFER:
                 try:
                     bot.send_message(
                         int(chat_id),
-                        f"⚠️ *Внимание!* Очередь в Бресте ≥ порога *{threshold}* авто.\n\n"
-                        + format_queue(queue),
-                        parse_mode='Markdown'
+                        f"⏰ *Планировщик: пора вставать в очередь!*\n\n"
+                        f"Желаемый выезд: *{fmt_dt(target_dt)}*\n"
+                        f"Сейчас в очереди: *{cars_now}* авто\n"
+                        f"Пропускная способность: *~{throughput:.0f}* авто/ч\n"
+                        f"Расчётное ожидание: *~{estimated_wait_h:.1f} ч*\n\n"
+                        f"🔴 Зарегистрируйтесь в электронной очереди прямо сейчас!\n"
+                        f"[belarusborder.by](https://belarusborder.by)",
+                        parse_mode='Markdown',
+                        disable_web_page_preview=True,
                     )
+                    update_chat_settings(chat_id, planner_notified=True)
                 except Exception:
                     pass
-
-            # ── Step alert ────────────────────────────────────────────────
-            step = cfg.get("step", 50)
-            notified_step = cfg.get("notified_step", 0)
-            if step > 0:
-                current_bucket = cars_count // step
-                if current_bucket > notified_step:
-                    # Notify for every newly crossed boundary
-                    for bucket in range(notified_step + 1, current_bucket + 1):
-                        milestone = bucket * step
-                        try:
-                            bot.send_message(
-                                int(chat_id),
-                                f"📈 *Очередь достигла {milestone} авто!*\n\n"
-                                + format_queue(queue),
-                                parse_mode='Markdown'
-                            )
-                        except Exception:
-                            pass
-                    updates["notified_step"] = current_bucket
-                elif current_bucket < notified_step:
-                    # Cars dropped — reset tracker so the next rise triggers again
-                    updates["notified_step"] = current_bucket
-
-            if updates:
-                update_chat_settings(chat_id, **updates)
 
 
 threading.Thread(target=monitor_loop, daemon=True).start()
@@ -231,6 +342,7 @@ def start(message):
         "/setstep — шаг уведомлений (каждые N авто)\n"
         "/setinterval — частота проверки (1 / 5 / 15 мин)\n"
         "/threshold — показать все настройки\n"
+        "/planner — планировщик выезда\n"
         "/source — статус соединения с источником данных\n"
         "/help — справка",
         parse_mode='Markdown'
@@ -256,6 +368,7 @@ def help_cmd(message):
         "/setinterval — частота проверки (1 / 5 / 15 мин)\n"
         "/threshold — показать все настройки\n"
         "/check — проверить очередь прямо сейчас\n"
+        "/planner — планировщик: ввести дату выезда, бот пришлёт сигнал когда пора вставать в очередь\n"
         "/source — статус соединения с источником данных\n\n"
         "Данные: belarusborder.by (электронная очередь БТС, реальное время)",
         parse_mode='Markdown'
@@ -358,27 +471,106 @@ def disable(message):
     bot.reply_to(message, "🔕 Уведомления *отключены*.", parse_mode='Markdown')
 
 
+THRESHOLD_PRESETS = [20, 50, 100, 150, 200, 300, 500]
+
+
+def _threshold_keyboard(current):
+    keyboard = telebot.types.InlineKeyboardMarkup(row_width=4)
+    buttons = [
+        telebot.types.InlineKeyboardButton(
+            text=f"{'✅ ' if t == current else ''}{t}",
+            callback_data=f"thr:{t}"
+        )
+        for t in THRESHOLD_PRESETS
+    ]
+    keyboard.add(*buttons)
+    keyboard.add(telebot.types.InlineKeyboardButton("✏️ Своё число", callback_data="thr:custom"))
+    return keyboard
+
+
 @bot.message_handler(commands=['set_threshold'])
 def set_threshold(message):
     chat_id = str(message.chat.id)
+    cfg = get_chat_settings(chat_id)
+    current = cfg.get("threshold", 50)
+
     parts = message.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(message, "⚠️ Укажите число, например: `/set_threshold 30`", parse_mode='Markdown')
+    if len(parts) >= 2:
+        try:
+            value = int(parts[1])
+            if value < 1 or value > 9999:
+                raise ValueError
+        except ValueError:
+            bot.reply_to(message, "⚠️ Введите целое число от 1 до 9999.")
+            return
+        update_chat_settings(chat_id, threshold=value)
+        status = "включены" if cfg["enabled"] else "выключены"
+        bot.reply_to(
+            message,
+            f"✅ Порог установлен: *{value}* авто.\nУведомления: {status}.",
+            parse_mode='Markdown'
+        )
         return
+
+    bot.reply_to(
+        message,
+        f"🎯 *Порог уведомления*\n\n"
+        f"Разовое оповещение придёт, когда очередь достигнет выбранного числа авто.\n"
+        f"Сейчас: *{current}* авто\n\n"
+        f"Выберите порог:",
+        reply_markup=_threshold_keyboard(current),
+        parse_mode='Markdown'
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("thr:"))
+def handle_threshold_callback(call):
+    chat_id = str(call.message.chat.id)
+    payload = call.data.split(":", 1)[1]
+
+    if payload == "custom":
+        bot.answer_callback_query(call.id)
+        sent = bot.send_message(chat_id, "✏️ Введите любое число от 1 до 9999:")
+        bot.register_next_step_handler(sent, _receive_custom_threshold)
+        return
+
     try:
-        value = int(parts[1])
+        value = int(payload)
+        if value not in THRESHOLD_PRESETS:
+            raise ValueError
+    except ValueError:
+        bot.answer_callback_query(call.id, "Неверное значение.")
+        return
+
+    update_chat_settings(chat_id, threshold=value)
+    bot.edit_message_text(
+        f"🎯 *Порог уведомления*\n\n"
+        f"Разовое оповещение придёт, когда очередь достигнет выбранного числа авто.\n\n"
+        f"✅ Установлено: *{value} авто*",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=_threshold_keyboard(value),
+        parse_mode='Markdown'
+    )
+    bot.answer_callback_query(call.id, f"Порог: {value} авто")
+
+
+def _receive_custom_threshold(message):
+    chat_id = str(message.chat.id)
+    try:
+        value = int(message.text.strip())
         if value < 1 or value > 9999:
             raise ValueError
     except ValueError:
-        bot.reply_to(message, "⚠️ Введите целое число от 1 до 9999.")
+        msg = bot.reply_to(message, "⚠️ Введите целое число от 1 до 9999:")
+        bot.register_next_step_handler(msg, _receive_custom_threshold)
         return
     update_chat_settings(chat_id, threshold=value)
     cfg = get_chat_settings(chat_id)
     status = "включены" if cfg["enabled"] else "выключены"
     bot.reply_to(
         message,
-        f"✅ Порог установлен: *{value}* легковых авто.\n"
-        f"Уведомления сейчас: {status}.",
+        f"✅ Порог установлен: *{value}* авто.\nУведомления: {status}.",
         parse_mode='Markdown'
     )
 
@@ -605,6 +797,195 @@ def handle_step_callback(call):
     bot.answer_callback_query(call.id, f"Шаг: {step_val} авто")
 
 
+# ── Planner ───────────────────────────────────────────────────────────────────
+
+_planner_pending: dict = {}   # chat_id -> {"date": "YYYY-MM-DD"} (ephemeral)
+
+
+def _parse_date(text: str) -> datetime.date | None:
+    text = text.strip()
+    today = datetime.date.today()
+    for fmt in ("%d.%m.%Y", "%d.%m"):
+        try:
+            d = datetime.datetime.strptime(text, fmt)
+            if fmt == "%d.%m":
+                year = today.year if (d.month, d.day) >= (today.month, today.day) else today.year + 1
+                d = d.replace(year=year)
+            return d.date()
+        except ValueError:
+            pass
+    return None
+
+
+def _planner_status_text(cfg: dict) -> str:
+    target_str = cfg.get("planner_target")
+    if not target_str:
+        return "📅 *Планировщик* не настроен."
+    try:
+        dt = datetime.datetime.strptime(target_str, "%Y-%m-%d %H:%M")
+    except Exception:
+        return "📅 *Планировщик* не настроен."
+    notified = cfg.get("planner_notified", False)
+    status = "✅ уведомление отправлено" if notified else "⏳ ожидаю подходящего момента"
+    tp = calc_throughput()
+    tp_str = f"~{tp:.0f} авто/ч" if tp else "накапливается история…"
+    return (
+        f"📅 *Планировщик активен*\n\n"
+        f"  Желаемый выезд: *{fmt_dt(dt)}*\n"
+        f"  Статус: {status}\n"
+        f"  Пропускная способность: {tp_str}"
+    )
+
+
+def _planner_main_keyboard(has_target: bool) -> telebot.types.InlineKeyboardMarkup:
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton("📅 Установить дату и время выезда", callback_data="planner:set"))
+    if has_target:
+        kb.add(telebot.types.InlineKeyboardButton("❌ Отменить план", callback_data="planner:cancel"))
+    return kb
+
+
+def _date_keyboard() -> telebot.types.InlineKeyboardMarkup:
+    today = datetime.date.today()
+    kb = telebot.types.InlineKeyboardMarkup(row_width=3)
+    options = []
+    labels = ["Сегодня", "Завтра", "Послезавтра"]
+    for i, label in enumerate(labels):
+        d = today + datetime.timedelta(days=i)
+        options.append(telebot.types.InlineKeyboardButton(
+            f"{label} ({d.strftime('%d.%m')})",
+            callback_data=f"planner_date:{d.isoformat()}"
+        ))
+    kb.add(*options)
+    kb.add(telebot.types.InlineKeyboardButton("✏️ Другая дата (DD.MM или DD.MM.YYYY)", callback_data="planner_date:custom"))
+    return kb
+
+
+@bot.message_handler(commands=['planner'])
+def planner_cmd(message):
+    chat_id = str(message.chat.id)
+    cfg = get_chat_settings(chat_id)
+    bot.reply_to(
+        message,
+        _planner_status_text(cfg),
+        reply_markup=_planner_main_keyboard(bool(cfg.get("planner_target"))),
+        parse_mode='Markdown'
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("planner:"))
+def handle_planner_callback(call):
+    chat_id = str(call.message.chat.id)
+    action = call.data.split(":", 1)[1]
+    bot.answer_callback_query(call.id)
+
+    if action == "cancel":
+        update_chat_settings(chat_id, planner_target=None, planner_notified=False)
+        _planner_pending.pop(chat_id, None)
+        bot.edit_message_text(
+            "❌ *Планировщик отменён.*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+
+    elif action == "set":
+        bot.edit_message_text(
+            "📅 *Шаг 1 из 2 — Выберите дату выезда:*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=_date_keyboard(),
+            parse_mode='Markdown'
+        )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("planner_date:"))
+def handle_planner_date(call):
+    chat_id = str(call.message.chat.id)
+    payload = call.data.split(":", 1)[1]
+    bot.answer_callback_query(call.id)
+
+    if payload == "custom":
+        sent = bot.send_message(chat_id, "✏️ Введите дату выезда (например: *20.06* или *20.06.2025*):", parse_mode='Markdown')
+        bot.register_next_step_handler(sent, _receive_planner_date)
+        return
+
+    try:
+        date = datetime.date.fromisoformat(payload)
+    except Exception:
+        bot.send_message(chat_id, "⚠️ Неверная дата.")
+        return
+
+    _planner_pending[chat_id] = {"date": date.isoformat()}
+    sent = bot.send_message(
+        chat_id,
+        f"🕐 *Шаг 2 из 2 — Введите желаемое время выезда* ({date.strftime('%d.%m.%Y')}):\n\nФормат: *ЧЧ:ММ* (например: `14:30`)",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(sent, _receive_planner_time)
+
+
+def _receive_planner_date(message):
+    chat_id = str(message.chat.id)
+    date = _parse_date(message.text or "")
+    if date is None:
+        msg = bot.reply_to(message, "⚠️ Не распознал дату. Введите в формате *DD.MM* или *DD.MM.YYYY*:", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, _receive_planner_date)
+        return
+    if date < datetime.date.today():
+        msg = bot.reply_to(message, "⚠️ Дата уже прошла. Введите будущую дату:")
+        bot.register_next_step_handler(msg, _receive_planner_date)
+        return
+    _planner_pending[chat_id] = {"date": date.isoformat()}
+    sent = bot.reply_to(
+        message,
+        f"🕐 *Шаг 2 из 2 — Введите желаемое время выезда* ({date.strftime('%d.%m.%Y')}):\n\nФормат: *ЧЧ:ММ* (например: `14:30`)",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(sent, _receive_planner_time)
+
+
+def _receive_planner_time(message):
+    chat_id = str(message.chat.id)
+    text = (message.text or "").strip()
+    try:
+        t = datetime.datetime.strptime(text, "%H:%M").time()
+    except ValueError:
+        msg = bot.reply_to(message, "⚠️ Не распознал время. Введите в формате *ЧЧ:ММ* (например: `14:30`):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, _receive_planner_time)
+        return
+
+    pending = _planner_pending.pop(chat_id, None)
+    if not pending:
+        bot.reply_to(message, "⚠️ Что-то пошло не так. Попробуйте /planner заново.")
+        return
+
+    date = datetime.date.fromisoformat(pending["date"])
+    target_dt = datetime.datetime.combine(date, t)
+    if target_dt <= datetime.datetime.now():
+        msg = bot.reply_to(message, "⚠️ Это время уже прошло. Введите другое время:")
+        bot.register_next_step_handler(msg, _receive_planner_time)
+        _planner_pending[chat_id] = pending
+        return
+
+    target_str = target_dt.strftime("%Y-%m-%d %H:%M")
+    update_chat_settings(chat_id, planner_target=target_str, planner_notified=False)
+
+    tp = calc_throughput()
+    tp_str = (f"\n\nПропускная способность сейчас: *~{tp:.0f}* авто/ч — данных достаточно 👍"
+              if tp else
+              "\n\n⚠️ Истории очереди пока мало (накапливается). Точность расчёта улучшится через несколько часов работы бота.")
+
+    bot.reply_to(
+        message,
+        f"✅ *Планировщик активирован!*\n\n"
+        f"Желаемый выезд: *{fmt_dt(target_dt)}*\n\n"
+        f"Бот рассчитает, когда нужно встать в электронную очередь, и пришлёт уведомление.{tp_str}\n\n"
+        f"Отменить: /planner → «Отменить план»",
+        parse_mode='Markdown'
+    )
+
+
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     bot.reply_to(message, "Напишите /check чтобы узнать очередь, или /help для справки.")
@@ -621,6 +1002,7 @@ if __name__ == '__main__':
         telebot.types.BotCommand("setinterval",   "🕐 Частота проверки"),
         telebot.types.BotCommand("set_threshold", "🎯 Задать порог"),
         telebot.types.BotCommand("threshold",     "📊 Мои настройки"),
+        telebot.types.BotCommand("planner",       "📅 Планировщик выезда"),
         telebot.types.BotCommand("source",        "🔌 Статус источника данных"),
         telebot.types.BotCommand("help",          "ℹ️ Справка"),
     ])
