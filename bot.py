@@ -806,6 +806,73 @@ def debug_stats(message):
     bot.send_message(chat_id, "\n\n".join(lines) or "Ничего не найдено.", parse_mode='Markdown')
 
 
+@bot.message_handler(commands=['debug_mon'])
+def debug_mon(message):
+    """Test scraping of throughput data from mon.declarant.by."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        bot.reply_to(message, "❌ beautifulsoup4 не установлен.")
+        return
+
+    chat_id = str(message.chat.id)
+    bot.reply_to(message, "🔍 Запрашиваю mon.declarant.by/zone/brest-bts…")
+
+    url = "https://mon.declarant.by/zone/brest-bts"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        status = resp.status_code
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Запрос не прошёл: `{str(e)[:200]}`", parse_mode='Markdown')
+        return
+
+    if status != 200:
+        bot.send_message(chat_id, f"❌ HTTP {status} от mon.declarant.by")
+        return
+
+    soup = BeautifulSoup(resp.content, 'html.parser')
+
+    lines = [f"✅ *HTTP {status}* · размер {len(resp.content)} байт\n"]
+
+    # Find relevant text nodes and show context
+    keywords = ["Направлено за последний час", "Направлено за последние 24 часа",
+                 "последний час", "24 час"]
+    found_any = False
+    for kw in keywords:
+        for elem in soup.find_all(string=lambda t: t and kw in t):
+            found_any = True
+            parent = elem.parent
+            parent_text = parent.get_text(separator=" ", strip=True)[:300]
+            # Try to extract a number
+            match = re.search(r'\d+', parent_text)
+            num = match.group() if match else "число не найдено"
+            lines.append(
+                f"🔑 *{kw}*\n"
+                f"  Тег: `{parent.name}`\n"
+                f"  Текст: `{parent_text}`\n"
+                f"  Число: *{num}*"
+            )
+            break  # one example per keyword is enough
+
+    if not found_any:
+        # Show first 600 chars of visible text so user can see what's there
+        visible = soup.get_text(separator=" ", strip=True)[:600]
+        lines.append(f"⚠️ Ключевые слова не найдены.\n\nВидимый текст страницы:\n`{visible}`")
+
+    # Also show what fetch_throughput_from_mon() actually returned
+    result = fetch_throughput_from_mon()
+    if result:
+        lines.append(
+            f"\n✅ *fetch\\_throughput\\_from\\_mon()* вернул:\n"
+            f"  направлено за посл. час: *{result.get('dispatched_1h')}*\n"
+            f"  направлено за 24ч: *{result.get('dispatched_24h')}*"
+        )
+    else:
+        lines.append("\n❌ *fetch\\_throughput\\_from\\_mon()* вернул `None`")
+
+    bot.send_message(chat_id, "\n\n".join(lines), parse_mode='Markdown')
+
+
 @bot.message_handler(commands=['enable'])
 def enable(message):
     chat_id = str(message.chat.id)
