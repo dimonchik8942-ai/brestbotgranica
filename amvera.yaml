@@ -1,0 +1,14 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.11"
+
+build:
+  installCommands:
+    - pip install -r requirements.txt
+
+run:
+  persistenceMount: /data
+  startCommands:
+    - python bot.py

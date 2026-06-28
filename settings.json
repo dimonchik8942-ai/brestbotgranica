@@ -1,11 +1,32 @@
 {
   "389597080": {
-    "threshold": 50,
+    "threshold": 300,
     "enabled": false,
     "interval": 5,
     "last_checked": 1780611501.6960182,
     "step": 25,
     "notified_step": 9,
-    "paused_until": 1780697943.3475397
+    "paused_until": 1780697943.3475397,
+    "step_baseline": null,
+    "threshold_notified": false,
+    "planner_target": null,
+    "planner_notified": false,
+    "notification_msg_ids": [
+      1306,
+      1312,
+      1342
+    ],
+    "tracked_cars": {
+      "AC38591": {
+        "milestones_done": [
+          300,
+          200
+        ],
+        "called_notified": false
+      }
+    },
+    "manual_rate": null,
+    "manual_dispatched_1h": null,
+    "manual_dispatched_24h": null
   }
 }

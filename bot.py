@@ -28,8 +28,9 @@ BTS_API = "https://belarusborder.by/info/monitoring-new"
 BTS_TOKEN = "test"
 BREST_CHECKPOINT_ID = "a9173a85-3fc0-424c-84f0-defa632481e4"
 
-SETTINGS_FILE  = os.path.join(os.path.dirname(__file__), "settings.json")
-HISTORY_FILE   = os.path.join(os.path.dirname(__file__), "queue_history.json")
+_DATA_DIR      = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_FILE  = os.path.join(_DATA_DIR, "settings.json")
+HISTORY_FILE   = os.path.join(_DATA_DIR, "queue_history.json")
 ALLOWED_INTERVALS = {1: "1 минута", 5: "5 минут", 15: "15 минут"}
 TICK = 60  # main loop ticks every 60 s; per-user interval is checked individually
 HISTORY_MAX_AGE    = 48 * 3600   # keep 48 h of readings
@@ -167,6 +168,7 @@ def _load_history() -> list:
 queue_history: list = _load_history()   # [[ts, cars], ...]
 _api_dispatched_24h: int | None = None  # "направлено за 24ч" from API
 _api_dispatched_1h:  int | None = None  # "направлено за последний час" from API
+_mon_last_fetch: float = 0              # timestamp of last mon.declarant.by fetch
 
 
 def add_history_point(ts: float, cars: int):
@@ -393,7 +395,7 @@ def format_queue(q: dict) -> str:
 # interval is checked individually for threshold/step notifications.
 
 def monitor_loop():
-    global _api_dispatched_24h, _api_dispatched_1h
+    global _api_dispatched_24h, _api_dispatched_1h, _mon_last_fetch
     while True:
         time.sleep(TICK)
         now = time.time()
@@ -403,19 +405,15 @@ def monitor_loop():
         if queue is not None:
             add_history_point(now, queue["cars_total"])
 
-        # Try to get throughput from mon.declarant.by first
-        mon_data = fetch_throughput_from_mon()
-        if mon_data:
-            if mon_data.get("dispatched_24h"):
-                _api_dispatched_24h = mon_data["dispatched_24h"]
-            if mon_data.get("dispatched_1h"):
-                _api_dispatched_1h = mon_data["dispatched_1h"]
-        # Fallback to belarusborder.by API if mon.declarant.by didn't work
-        elif queue:
-            if queue.get("dispatched_24h"):
-                _api_dispatched_24h = queue["dispatched_24h"]
-            if queue.get("dispatched_1h"):
-                _api_dispatched_1h = queue["dispatched_1h"]
+        # Fetch throughput from mon.declarant.by every 5 minutes
+        if now - _mon_last_fetch >= 300:
+            mon = fetch_throughput_from_mon()
+            if mon:
+                if mon.get("dispatched_1h") is not None:
+                    _api_dispatched_1h = mon["dispatched_1h"]
+                if mon.get("dispatched_24h") is not None:
+                    _api_dispatched_24h = mon["dispatched_24h"]
+            _mon_last_fetch = now
 
         with settings_lock:
             snapshot = {cid: dict(cfg) for cid, cfg in settings.items()}
